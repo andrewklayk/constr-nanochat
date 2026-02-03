@@ -4,8 +4,8 @@ All the generic code lives here, and all the evaluation-specific
 code lives in nanochat directory and is imported from here.
 
 Example runs:
-python -m scripts.chat_eval -a ARC-Easy
-torchrun --nproc_per_node=8 -m scripts.chat_eval -- -a ARC-Easy
+python -m scripts.chat_eval -i mid -a ARC-Easy
+torchrun --nproc_per_node=8 -m scripts.chat_eval -- -i mid -a ARC-Easy
 """
 
 import argparse
@@ -23,6 +23,7 @@ from tasks.humaneval import HumanEval
 from tasks.mmlu import MMLU
 from tasks.arc import ARC
 from tasks.gsm8k import GSM8K
+from tasks.opencoder import OpenCoder
 from tasks.spellingbee import SpellingBee
 
 # -----------------------------------------------------------------------------
@@ -167,6 +168,7 @@ def run_chat_eval(task_name, model, tokenizer, engine,
         'ARC-Challenge': partial(ARC, subset="ARC-Challenge", split="test"),
         'GSM8K': partial(GSM8K, subset="main", split="test"),
         'SpellingBee': partial(SpellingBee, size=256, split="test"),
+        'OpenCoder': partial(OpenCoder, subset='evol_instruct', split="train", stop=300)
     }[task_name]
     task_object = task_module()
     # Run the evaluation
@@ -206,7 +208,15 @@ if __name__ == "__main__":
     engine = Engine(model, tokenizer)
 
     # Get the tasks to evaluate on
-    all_tasks = ['ARC-Easy', 'ARC-Challenge', 'MMLU', 'GSM8K', 'HumanEval', 'SpellingBee']
+    all_tasks = [
+    # 'ARC-Easy',
+    # 'ARC-Challenge',
+    # 'MMLU',
+    # 'GSM8K',
+    # 'HumanEval',
+    # 'SpellingBee',
+    'OpenCoder'
+    ]
     baseline_accuracies = {
         'ARC-Easy': 0.25, # multiple choice 1 of 4 => 25%
         'ARC-Challenge': 0.25, # multiple choice 1 of 4 => 25%

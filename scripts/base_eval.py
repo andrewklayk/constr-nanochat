@@ -52,6 +52,7 @@ def evaluate_model(model, tokenizer, device, max_per_task=-1):
     """
     # Load config and task metadata
     base_dir = get_base_dir()
+    print0(f'Base dir: {base_dir}')
     eval_bundle_dir = os.path.join(base_dir, "eval_bundle")
     # Download the eval bundle to disk (and unzip if needed)
     if not os.path.exists(eval_bundle_dir):
@@ -78,6 +79,8 @@ def evaluate_model(model, tokenizer, device, max_per_task=-1):
     for task in tasks:
         start_time = time.time()
         label = task['label']
+        if task['label'] in ['squad']:
+            continue
         task_meta = {
             'task_type': task['icl_task_type'],
             'dataset_uri': task['dataset_uri'],
@@ -149,6 +152,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--hf-path', type=str, default=None, help='HuggingFace model path to evaluate')
     parser.add_argument('--max-per-task', type=int, default=-1, help='Max examples per task to evaluate (-1 = disable)')
+    parser.add_argument('--model-tag', type=str, default=None, help='optional model tag for the output directory name')
+    parser.add_argument('--step', type=str, default=None, help='optional model step for the output directory name')
     args = parser.parse_args()
 
     # distributed / precision setup
@@ -166,7 +171,7 @@ def main():
         model_slug = hf_path.replace("/", "-") # for the output csv file
     else:
         # load a local model from the file system
-        model, tokenizer, meta = load_model("base", device, phase="eval")
+        model, tokenizer, meta = load_model("base", device, phase="eval", model_tag=args.model_tag, step=args.step)
         model_name = f"base_model (step {meta['step']})" # just for logging
         model_slug = f"base_model_{meta['step']:06d}" # for the output csv file
 

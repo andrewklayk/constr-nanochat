@@ -9,11 +9,12 @@ Or torchrun for training:
 torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft
 """
 
-import argparse
 import os
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import wandb
+import argparse
+import os
 import torch
 import torch.distributed as dist
 from contextlib import nullcontext
@@ -32,6 +33,46 @@ from tasks.customjson import CustomJSON
 from tasks.spellingbee import SimpleSpelling, SpellingBee
 from tasks.opencoder import OpenCoder
 
+OPT = 'alm'
+# OPT = 'pbm'
+
+def eval_mult_choice(step, device_batch_size, eval_metrics_max_problems, autocast_ctx, wandb_run, model, tokenizer, engine):
+    model.eval()
+    metrics = {}
+    with torch.no_grad(), autocast_ctx:
+        # note that because these are inside no_grad, we can usually afford to at least ~2X the batch size
+        metrics["mmlu_acc"] = run_chat_eval("MMLU", model, tokenizer, engine, batch_size=device_batch_size*2, max_problems=eval_metrics_max_problems)
+        metrics["arc_easy_acc"] = run_chat_eval("ARC-Easy", model, tokenizer, engine, batch_size=device_batch_size*2, max_problems=eval_metrics_max_problems)
+    metrics_str = ', '.join(f'{k}: {v:.6f}' for k, v in metrics.items())
+    print0(f"Step {step:05d} | {metrics_str}")
+    wandb_run.log({
+        "step": step,
+        **metrics,
+    })
+    model.train()
+    return metrics
+
+def eval_val_loss(step, eval_steps, ddp, autocast_ctx, wandb_run, model, build_val_loader):
+    model.eval()
+    val_iter = iter(build_val_loader())
+    losses = []
+    for _ in range(eval_steps):
+        val_inputs, val_targets = next(val_iter)
+        with torch.no_grad(), autocast_ctx:
+            loss = model(val_inputs, val_targets)
+        losses.append(loss)
+    val_loss = torch.stack(losses).mean() # average over eval_steps
+    if ddp:
+        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG) # average over ranks
+    val_loss = val_loss.item()
+    print0(f"Step {step:05d} | Validation loss: {val_loss:.6f}")
+    wandb_run.log({
+        "step": step,
+        "val_loss": val_loss,
+    })
+    model.train()
+    return val_loss
+
 # -----------------------------------------------------------------------------
 # CLI arguments
 parser = argparse.ArgumentParser(description="Supervised finetuning for chat")
@@ -44,6 +85,8 @@ parser.add_argument("--dtype", type=str, default="bfloat16", help="float32|bfloa
 parser.add_argument("--source", type=str, default="mid", help="base|mid - which checkpoint to load from")
 parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
 parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
+# Model saving
+parser.add_argument("--model-name", type=str, default=None, help="model name to append to the tag")
 # Training horizon
 parser.add_argument("--num-epochs", type=int, default=1, help="number of epochs")
 parser.add_argument("--num-iterations", type=int, default=-1, help="override number of iterations (-1 = use num_epochs)")
@@ -51,6 +94,7 @@ parser.add_argument("--num-iterations", type=int, default=-1, help="override num
 parser.add_argument("--device-batch-size", type=int, default=4, help="per-device batch size")
 parser.add_argument("--target-examples-per-step", type=int, default=32, help="target examples per optimization step")
 # Optimization
+parser.add_argument("--opt", type=str, default=None, help="constrained optimizer to use (PBM / ALM)")
 parser.add_argument("--embedding-lr", type=float, default=0.2, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
@@ -64,6 +108,8 @@ parser.add_argument("--eval-metrics-max-problems", type=int, default=1024, help=
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
+
+OPT = args.opt or OPT
 
 # Compute init
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
@@ -95,6 +141,7 @@ train_ds = TaskMixture([
     SpellingBee(size=600, split="train"), # 300 rows of Spelling Bee (e.g. how many 'r' are in 'strawberry'?)
 ]) # 2.3K + 1.1K + 8K + 10K + 1K + 0.3K + 0.3K = 23K rows
 val_ds = SmolTalk(split="test") # general conversations, 24K rows (though we don't actually use all of it)
+
 
 # -----------------------------------------------------------------------------
 # DataLoader
@@ -151,11 +198,13 @@ build_val_loader = lambda: sft_data_generator(val_ds, batch_size=args.device_bat
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer
 
-optimizers = model.setup_optimizers(
+optimizers = model.setup_constrained_optimizer(
     unembedding_lr=args.unembedding_lr,
     embedding_lr=args.embedding_lr,
     matrix_lr=args.matrix_lr,
-    weight_decay=args.weight_decay,
+    device='cuda',
+    optimizer=OPT,
+    opt_kwargs = {'epoch_len': (len(train_ds) // args.target_examples_per_step) } if OPT=='pbm' else {}
 )
 # Set the initial learning rate as a fraction of the base learning rate
 for opt in optimizers:
@@ -173,59 +222,49 @@ def get_lr_multiplier(it):
 
 # Go!
 step = 0
+train_iter = iter(train_loader)
+
 for step in range(num_iterations):
     last_step = step == num_iterations - 1
 
     # evaluate the validation loss
     if last_step or step % args.eval_every == 0:
-        model.eval()
-        val_loader = build_val_loader()
-        losses = []
-        for _ in range(args.eval_steps):
-            val_inputs, val_targets = next(val_loader)
-            with torch.no_grad(), autocast_ctx:
-                loss = model(val_inputs, val_targets)
-            losses.append(loss)
-        val_loss = torch.stack(losses).mean() # average over eval_steps
-        if ddp:
-            dist.all_reduce(val_loss, op=dist.ReduceOp.AVG) # average over ranks
-        val_loss = val_loss.item()
-        print0(f"Step {step:05d} | Validation loss: {val_loss:.6f}")
-        wandb_run.log({
-            "step": step,
-            "val_loss": val_loss,
-        })
-        model.train()
+        val_loss = eval_val_loss(step, args.eval_steps, ddp, autocast_ctx, wandb_run, model, build_val_loader)
 
     # evaluate accuracy of the multiple choice tasks (which are quick to run)
     if last_step or (step > 0 and step % args.eval_metrics_every == 0):
-        model.eval()
-        metrics = {}
-        with torch.no_grad(), autocast_ctx:
-            # note that because these are inside no_grad, we can usually afford to at least ~2X the batch size
-            metrics["mmlu_acc"] = run_chat_eval("MMLU", model, tokenizer, engine, batch_size=args.device_batch_size*2, max_problems=args.eval_metrics_max_problems)
-            metrics["arc_easy_acc"] = run_chat_eval("ARC-Easy", model, tokenizer, engine, batch_size=args.device_batch_size*2, max_problems=args.eval_metrics_max_problems)
-        metrics_str = ', '.join(f'{k}: {v:.6f}' for k, v in metrics.items())
-        print0(f"Step {step:05d} | {metrics_str}")
-        wandb_run.log({
-            "step": step,
-            **metrics,
-        })
-        model.train()
+        metrics = eval_mult_choice(step, args.device_batch_size, args.eval_metrics_max_problems, autocast_ctx, wandb_run, model, tokenizer, engine)
 
     if last_step:
         break
 
     # evaluate the gradient
     num_tokens = torch.tensor(0, device=device) # the number of "active" tokens of supervision seen
+    loss, constraint = 0., 0.
     for micro_step in range(grad_accum_steps):
-        train_inputs, train_targets = next(train_loader)
+        train_inputs, train_targets = next(train_iter)
         with autocast_ctx:
-            loss = model(train_inputs, train_targets)
-        train_loss = loss.detach() # for logging
-        loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
-        loss.backward() # accumulate the gradient
-        num_tokens += (train_targets >= 0).sum()
+            micro_loss, micro_constraint = model(train_inputs, train_targets, eval_constraints=True)
+            loss += micro_loss
+            constraint += micro_constraint
+
+    loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+    constraint = constraint / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+    
+    train_loss = loss.detach() # for logging
+    train_constr = constraint.detach() # for logging
+    
+    if OPT == 'alm':
+        constraint.backward(retain_graph=True)    
+        optimizers[0].dual_step(0, constraint)
+        optimizers[0].zero_grad()
+    else:
+        optimizers[0].dual_step(0, constraint)
+
+    # PBM calls backward implicitly in step after constructing the barrier-lagrangian fn
+    if OPT == 'alm':
+        loss.backward()
+    num_tokens += (train_targets >= 0).sum()
     if ddp:
         dist.all_reduce(num_tokens, op=dist.ReduceOp.SUM) # sum over ranks
 
@@ -237,13 +276,15 @@ for step in range(num_iterations):
 
     # step the optimizers
     for opt in optimizers:
-        opt.step()
-    model.zero_grad(set_to_none=True)
+        opt.step(loss)
+    optimizers[0].zero_grad(set_to_none=True)
 
     # logging
     train_loss_item = train_loss.item()
     num_tokens_item = num_tokens.item()
-    print0(f"Step {step:05d}/{num_iterations:05d} | Training loss: {train_loss_item:.6f}| lrm: {lrm:.6f}| num_tokens: {num_tokens_item:,}")
+    constraint_item = constraint.item()
+    with torch.no_grad():
+        print0(f"Step {step:05d}/{num_iterations:05d} | Training loss: {train_loss_item:.6f} | Training constraint: {constraint_item:.6f}, duals {optimizers[0]._dual_vars.cpu().numpy()}| lrm: {lrm:.6f}| num_tokens: {num_tokens_item:,}")
     wandb_run.log({
         "step": step,
         "lrm": lrm,
@@ -256,8 +297,8 @@ for step in range(num_iterations):
 if master_process:
     base_dir = get_base_dir()
     depth = model.config.n_layer
-    output_dirname = args.model_tag if args.model_tag else f"d{depth}" # e.g. d12
-    checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
+    model_tag = f"d{depth}" # base the model tag on the depth of the base model
+    checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", model_tag + args.model_name)
     model_config_kwargs = model.config.__dict__ # slightly naughty, abusing the simplicity of GPTConfig, TODO nicer
     save_checkpoint(
         checkpoint_dir,

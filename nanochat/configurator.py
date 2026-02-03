@@ -48,7 +48,7 @@ for arg in sys.argv[1:]:
             if globals()[key] is not None:
                 attempt_type = type(attempt)
                 default_type = type(globals()[key])
-                assert attempt_type == default_type, f"Type mismatch: {attempt_type} != {default_type}"
+                assert attempt_type == default_type or key == 'tag_postfix', f"Type mismatch: {attempt_type} != {default_type} for {key}"
             # cross fingers
             print0(f"Overriding: {key} = {attempt}")
             globals()[key] = attempt
